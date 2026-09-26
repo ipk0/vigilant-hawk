@@ -6,7 +6,6 @@ import akka.actor.typed.{ActorRef, Behavior}
 import akka.cluster.ddata.typed.scaladsl.{DistributedData, ReplicatorMessageAdapter}
 import akka.cluster.ddata.typed.scaladsl.Replicator._
 import akka.cluster.ddata.{LWWMap, LWWMapKey, ReplicatedData, SelfUniqueAddress}
-import akka.util.Timeout
 import ua.net.ipk0.core.PowerUnit.Projection.{Green, Projection, Red, Yellow}
 import mouse.all._
 import cats._
@@ -33,6 +32,7 @@ object PowerUnit {
   private sealed trait InternalCommand extends Command
   private case class InternalSubscribeResponse(rsp: SubscribeResponse[LWWMap[Domain, StateProjection]]) extends InternalCommand
   private case class InternalUpdateResponse[A <: ReplicatedData](rsp: UpdateResponse[A]) extends InternalCommand
+  private case class DelayedGridUpdate(globalState: LWWMap[Domain, StateProjection]) extends InternalCommand
   private case object MonitorState extends InternalCommand
   private case class EmergencyMonitorState(reloadUnitSet: Boolean = false) extends InternalCommand
   private case class StateChanged(newState: Projection) extends InternalCommand
@@ -40,8 +40,8 @@ object PowerUnit {
   private case class PushRefund(requesterId: Domain, power: Int) extends InternalCommand
   private case class EmergencyAsk(requesterId: Domain, amount: Int, replyTo: ActorRef[Command]) extends InternalCommand
   private case class EmergencyAck(lenderId: Domain, amount: Int) extends InternalCommand
-  private case class DebtorTerminated(domain: Domain) extends InternalCommand
-  private case class LeanderTerminated(domain: Domain) extends InternalCommand
+  private case class PeerTerminated(domain: Domain) extends InternalCommand
+  private case class EmergencyAskTimeout(lenderId: Domain) extends InternalCommand
   private case object EmptyEmergencyList extends InternalCommand
 
   private def determineShardState(currentPowerValue: Int, nominalPower: Int)(implicit context: ActorContext[Command]): Projection = {
@@ -78,7 +78,6 @@ object PowerUnit {
       context.self ! MonitorState
       Behaviors.same
     case Stop =>
-      context.system.terminate()
       Behaviors.stopped
   }
   private def regularBehaviour(unitState: PowerUnitState)(implicit replicator: ReplicatorMessageAdapter[Command, LWWMap[Domain, StateProjection]],
@@ -109,7 +108,7 @@ object PowerUnit {
           replyTo ! EmergencyAck(unitState.id, 0)
           Behaviors.same[Command]
         })(extra => {
-          context.watchWith(requesterId.actorRef, DebtorTerminated(requesterId))
+          context.watchWith(requesterId.actorRef, PeerTerminated(requesterId))
           replyTo ! EmergencyAck(unitState.id, extra)
           context.self ! MonitorState
           regularBehaviour(unitState = unitState.copy(nominalPower = unitState.nominalPower - extra, assets = unitState.assets.addDebtor(requesterId, extra)))
@@ -127,27 +126,29 @@ object PowerUnit {
         regularBehaviour(unitState = modifiedState)
       case MonitorState =>
         val currentShardState = determineShardState(unitState.actualPower, unitState.nominalPower)
-        isStateChanged(unitState, currentShardState) ?? (notifyReplicator(unitState, currentShardState) |+| /*context.system.eventStream ! EventStream.Publish(unitState.id -> updatedGlobalState) |+|*/ context.self ! StateChanged(currentShardState))
+        val stateChanged = isStateChanged(unitState, currentShardState)
+        stateChanged ?? notifyReplicator(unitState, currentShardState)
+        (stateChanged || currentShardState == Red) ?? (context.self ! StateChanged(currentShardState))
         regularBehaviour(unitState = unitState.copy(globalState = unitState.globalState.:+(unitState.id -> StateProjection(currentShardState))))
       case InternalSubscribeResponse(entirePowerGrid@Changed(key)) =>
         context.log.info(s"[id][EntirePowerGrid State Changed] : ${entirePowerGrid.get(key)}")
-        val globalState = entirePowerGrid.get(key)
-        Thread.sleep(Math.abs(unitState.id.regionId + 10) * 2) //todo: to slow
-        context.system.eventStream ! EventStream.Publish(unitState.id -> globalState)
-        regularBehaviour(unitState = unitState.copy(globalState = globalState))
-      case LeanderTerminated(domain) =>
+        scheduleGridUpdate(unitState, entirePowerGrid.get(key))
+        Behaviors.same
+      case DelayedGridUpdate(globalState) =>
+        regularBehaviour(unitState = applyGridUpdate(unitState, globalState))
+      case PeerTerminated(domain) =>
         context.self ! MonitorState
         notifyDeletionAction(unitState, domain)
-        regularBehaviour(unitState.decreaseNominalPower(unitState.assets.lenders.get(domain).orEmpty).copy(assets = unitState.assets.dropLender(domain)))
-      case DebtorTerminated(domain) =>
+        regularBehaviour(dropPeer(unitState, domain))
+      case EmergencyAck(lenderId, amount) if amount > 0 =>
+        context.watchWith(lenderId.actorRef, PeerTerminated(lenderId))
         context.self ! MonitorState
-        notifyDeletionAction(unitState, domain)
-        regularBehaviour(unitState.increaseNominalPower(unitState.assets.debtors.get(domain).orEmpty).copy(assets = unitState.assets.dropDebtor(domain)))
-      case InternalUpdateResponse(data) => //todo
-        context.log.error("InternalUpdateResponse {}" ,data)
+        regularBehaviour(unitState.increaseNominalPower(amount).copy(assets = unitState.assets.addLender(lenderId, amount)))
+      case InternalUpdateResponse(data) =>
+        logUpdateResponse(data)
         context.system.eventStream ! EventStream.Publish(unitState.id -> unitState.globalState)
         Behaviors.same
-      case InternalSubscribeResponse(_) | InternalUpdateResponse(_) | EmergencyMonitorState(_) => Behaviors.same // ok
+      case InternalSubscribeResponse(_) | InternalUpdateResponse(_) | EmergencyMonitorState(_) | EmergencyAck(_, _) | EmergencyAskTimeout(_) => Behaviors.same
     })
   }
 
@@ -179,7 +180,7 @@ object PowerUnit {
     filterDomain(list, extraPower)(Nil)
   }
 
-  private def emergencyStateBehaviour(unitState: PowerUnitState, closestUnits: List[Domain])(implicit replicator: ReplicatorMessageAdapter[Command, LWWMap[Domain, StateProjection]],
+  private def emergencyStateBehaviour(unitState: PowerUnitState, closestUnits: List[Domain], awaitingLender: Option[Domain] = None)(implicit replicator: ReplicatorMessageAdapter[Command, LWWMap[Domain, StateProjection]],
     entirePowerGridKey: LWWMapKey[Domain, StateProjection], context: ActorContext[Command], node: SelfUniqueAddress): Behavior[Command] = {
     Behaviors.withTimers { timers =>
       Behaviors.receiveMessagePartial(commonBehaviour(unitState).orElse {
@@ -187,42 +188,45 @@ object PowerUnit {
           case Green =>
             val list = refundCandidates(listEndmostPoint(unitState.assets.lenders, unitState.id.regionId), unitState.extraPower)
 
-            context.log.error(s"Candidates to refund: $list")
+            context.log.info(s"Candidates to refund: $list")
 
             list.foreach(pair => pair._1.actorRef ! PushRefund(unitState.id, pair._2))
 
             val domainList = list.map(_._1)
             val totalPushedPower = list.map(_._2).sum
+            awaitingLender.foreach(timers.cancel)
 
             regularBehaviour(unitState.copy(nominalPower = unitState.nominalPower - totalPushedPower, assets = unitState.assets.dropLenders(domainList)))
-          case Yellow => regularBehaviour(unitState)
+          case Yellow =>
+            awaitingLender.foreach(timers.cancel)
+            regularBehaviour(unitState)
+          case _ if awaitingLender.isDefined => Behaviors.same
           case _ =>
             context.log.info(s"It's about to change status to RED. State: $unitState")
-            implicit val timeout = Timeout(10.seconds)
-
-            import scala.util.Success
-            import scala.util.Failure
-
-            closestUnits.headOption.cata({ closestUnit: Domain =>
-              context.ask(closestUnit.actorRef, createRequest(unitState)) {
-                case Success(res: EmergencyAck) => res
-                case Failure(ex) =>
-                  context.log.error(s"Request failed. Try to get next unit. Details: $ex")
-                  EmergencyAck(closestUnit, 0)
-              }
-            }, {
-              context.self ! EmptyEmergencyList
-              emergencyStateBehaviour(unitState, Nil)
-            })
-            emergencyStateBehaviour(unitState, closestUnits.nonEmpty ?? closestUnits.tail)
+            closestUnits match {
+              case closestUnit :: rest =>
+                closestUnit.actorRef ! createRequest(unitState)(context.self)
+                timers.startSingleTimer(closestUnit, EmergencyAskTimeout(closestUnit), 10.seconds)
+                emergencyStateBehaviour(unitState, rest, Some(closestUnit))
+              case Nil =>
+                context.self ! EmptyEmergencyList
+                Behaviors.same
+            }
         }
-        case EmergencyAck(lenderId, amount) =>
+        case EmergencyAskTimeout(lenderId) if awaitingLender.contains(lenderId) =>
+          context.log.error(s"Request to $lenderId timed out. Try to get next unit.")
           context.self ! EmergencyMonitorState()
+          emergencyStateBehaviour(unitState, closestUnits)
+        case EmergencyAskTimeout(_) => Behaviors.same
+        case EmergencyAck(lenderId, amount) =>
+          timers.cancel(lenderId)
+          context.self ! EmergencyMonitorState()
+          val stillAwaiting = awaitingLender.filterNot(_ == lenderId)
           Option.when(amount > 0) {
-            context.watchWith(lenderId.actorRef, LeanderTerminated(lenderId))
-            emergencyStateBehaviour(unitState.increaseNominalPower(amount).copy(assets = unitState.assets.addLender(lenderId, amount)), closestUnits)
+            context.watchWith(lenderId.actorRef, PeerTerminated(lenderId))
+            emergencyStateBehaviour(unitState.increaseNominalPower(amount).copy(assets = unitState.assets.addLender(lenderId, amount)), closestUnits, stillAwaiting)
           } getOrElse {
-            emergencyStateBehaviour(unitState, closestUnits)
+            emergencyStateBehaviour(unitState, closestUnits, stillAwaiting)
           }
         case EmptyEmergencyList =>
           timers.startSingleTimer(EmergencyMonitorState(true), FiniteDuration(1, TimeUnit.MINUTES))
@@ -231,41 +235,60 @@ object PowerUnit {
           val newStateProjection = determineShardState(unitState.actualPower, unitState.nominalPower)
           isStateChanged(unitState, newStateProjection) ?? notifyReplicator(unitState, newStateProjection)
           context.self ! StateChanged(newStateProjection)
-          emergencyStateBehaviour(unitState = unitState.copy(globalState = unitState.globalState.:+(unitState.id -> StateProjection(newStateProjection))), Option.when(reloadUnitSet)(reloadClosestUnits(unitState)).getOrElse(closestUnits))
+          emergencyStateBehaviour(unitState = unitState.copy(globalState = unitState.globalState.:+(unitState.id -> StateProjection(newStateProjection))), Option.when(reloadUnitSet)(reloadClosestUnits(unitState)).getOrElse(closestUnits), awaitingLender)
+        case MonitorState =>
+          context.self ! EmergencyMonitorState()
+          Behaviors.same
         case EmergencyAsk(_, _, replyTo) =>
           replyTo ! EmergencyAck(unitState.id, 0)
           Behaviors.same
         case PullRefund(requesterId, amount) =>
           context.self ! EmergencyMonitorState()
-          emergencyStateBehaviour(unitState = unitState.decreaseNominalPower(amount).copy(assets = unitState.assets.dropLender(requesterId)), closestUnits)
+          emergencyStateBehaviour(unitState = unitState.decreaseNominalPower(amount).copy(assets = unitState.assets.dropLender(requesterId)), closestUnits, awaitingLender)
         case PushRefund(requesterId, amount) =>
-          context.self ! MonitorState
-          emergencyStateBehaviour(unitState = unitState.increaseNominalPower(amount).copy(assets = unitState.assets.dropDebtor(requesterId)), closestUnits)
+          context.self ! EmergencyMonitorState()
+          emergencyStateBehaviour(unitState = unitState.increaseNominalPower(amount).copy(assets = unitState.assets.dropDebtor(requesterId)), closestUnits, awaitingLender)
         case ExternalActualPowerOrder(actualPowerReq, replyTo) =>
           val modifiedState = unitState.copy(actualPower = actualPowerReq)
           replyTo ! ExternalActualPowerOrderAck(modifiedState.actualPower, modifiedState.nominalPower)
           context.self ! EmergencyMonitorState()
-          emergencyStateBehaviour(unitState = modifiedState, closestUnits)
+          emergencyStateBehaviour(unitState = modifiedState, closestUnits, awaitingLender)
         case InternalSubscribeResponse(entirePowerGrid@Changed(key)) =>
-          Thread.sleep(Math.abs(unitState.id.regionId + 10) * 2) //todo: to slow
-          val globalState = entirePowerGrid.get(key)
-          context.system.eventStream ! EventStream.Publish(globalState)
-          emergencyStateBehaviour(unitState = unitState.copy(globalState = globalState), closestUnits)
-        case LeanderTerminated(domain) =>
+          scheduleGridUpdate(unitState, entirePowerGrid.get(key))
+          Behaviors.same
+        case DelayedGridUpdate(globalState) =>
+          emergencyStateBehaviour(unitState = applyGridUpdate(unitState, globalState), closestUnits, awaitingLender)
+        case PeerTerminated(domain) =>
           context.self ! EmergencyMonitorState()
           notifyDeletionAction(unitState, domain)
-          emergencyStateBehaviour(unitState.decreaseNominalPower(unitState.assets.lenders.get(domain).orEmpty).copy(assets = unitState.assets.dropLender(domain)), closestUnits)
-        case DebtorTerminated(domain) =>
-          context.self ! EmergencyMonitorState()
-          notifyDeletionAction(unitState, domain)
-          emergencyStateBehaviour(unitState.increaseNominalPower(unitState.assets.debtors.get(domain).orEmpty).copy(assets = unitState.assets.dropDebtor(domain)), closestUnits)
-        case InternalUpdateResponse(data) => //todo
-          context.log.error("InternalUpdateResponse2 {}", data)
+          emergencyStateBehaviour(dropPeer(unitState, domain), closestUnits, awaitingLender)
+        case InternalUpdateResponse(data) =>
+          logUpdateResponse(data)
           context.system.eventStream ! EventStream.Publish(unitState.id -> unitState.globalState)
           Behaviors.same
       })
     }
   }
+
+  private def scheduleGridUpdate(unitState: PowerUnitState, globalState: LWWMap[Domain, StateProjection])(implicit context: ActorContext[Command]): Unit =
+    context.scheduleOnce((Math.abs(unitState.id.regionId + 10) * 2).millis, context.self, DelayedGridUpdate(globalState))
+
+  private def applyGridUpdate(unitState: PowerUnitState, globalState: LWWMap[Domain, StateProjection])(implicit context: ActorContext[Command]): PowerUnitState = {
+    val merged = unitState.globalState.merge(globalState)
+    context.system.eventStream ! EventStream.Publish(unitState.id -> merged)
+    unitState.copy(globalState = merged)
+  }
+
+  private def logUpdateResponse[A <: ReplicatedData](rsp: UpdateResponse[A])(implicit context: ActorContext[Command]): Unit = rsp match {
+    case UpdateSuccess(_) => context.log.debug("Replicator update succeeded: {}", rsp)
+    case _ => context.log.error("Replicator update failed: {}", rsp)
+  }
+
+  private def dropPeer(unitState: PowerUnitState, domain: Domain): PowerUnitState =
+    unitState
+      .decreaseNominalPower(unitState.assets.lenders.get(domain).orEmpty)
+      .increaseNominalPower(unitState.assets.debtors.get(domain).orEmpty)
+      .copy(assets = unitState.assets.dropLender(domain).dropDebtor(domain))
 
   private def createRequest(unitState: PowerUnitState): ActorRef[Command] => Command = replyTo => EmergencyAsk(unitState.id, unitState.actualPower - unitState.nominalPower, replyTo)
 
@@ -325,6 +348,6 @@ object PowerUnit {
 
     def extraPower: Int = state.nominalPower - state.actualPower
 
-    def getExtraPower(amount: Int): Option[Int] = Option.when(extraPower >= 0)(Math.min(extraPower, amount))
+    def getExtraPower(amount: Int): Option[Int] = Option.when(extraPower > 0)(Math.min(extraPower, amount))
   }
 }

@@ -10,9 +10,9 @@ object Utilities {
   def compareByRankEndmost(point: Int): RankComparator =
     (t1, t2) => orderByRankEndmost(t1, t2, point)
 
-  private def orderByRankClosest(first: Int, second: Int, point: Int): Boolean = byRank(first, point) <= byRank(second, point)
+  private def orderByRankClosest(first: Int, second: Int, point: Int): Boolean = byRank(first, point) < byRank(second, point)
 
-  private def orderByRankEndmost(first: Int, second: Int, point: Int): Boolean = byRank(first, point) >= byRank(second, point)
+  private def orderByRankEndmost(first: Int, second: Int, point: Int): Boolean = byRank(first, point) > byRank(second, point)
 
   private def byRank(target: Int, point: Int): Int = {
     if (point >= target) {
