@@ -29,17 +29,17 @@ object PowerUnit {
   case class UnitStateAck(unitState: PowerUnitState) extends Command
   case object Start extends Command
   case object Stop extends Command
-  private sealed trait InternalCommand extends Command
+  private[core] sealed trait InternalCommand extends Command
   private case class InternalSubscribeResponse(rsp: SubscribeResponse[LWWMap[Domain, StateProjection]]) extends InternalCommand
   private case class InternalUpdateResponse[A <: ReplicatedData](rsp: UpdateResponse[A]) extends InternalCommand
   private case class DelayedGridUpdate(globalState: LWWMap[Domain, StateProjection]) extends InternalCommand
   private case object MonitorState extends InternalCommand
   private case class EmergencyMonitorState(reloadUnitSet: Boolean = false) extends InternalCommand
   private case class StateChanged(newState: Projection) extends InternalCommand
-  private case class PullRefund(requesterId: Domain, power: Int) extends InternalCommand
-  private case class PushRefund(requesterId: Domain, power: Int) extends InternalCommand
-  private case class EmergencyAsk(requesterId: Domain, amount: Int, replyTo: ActorRef[Command]) extends InternalCommand
-  private case class EmergencyAck(lenderId: Domain, amount: Int) extends InternalCommand
+  private[core] case class PullRefund(requesterId: Domain, power: Int) extends InternalCommand
+  private[core] case class PushRefund(requesterId: Domain, power: Int) extends InternalCommand
+  private[core] case class EmergencyAsk(requesterId: Domain, amount: Int, replyTo: ActorRef[Command]) extends InternalCommand
+  private[core] case class EmergencyAck(lenderId: Domain, amount: Int) extends InternalCommand
   private case class PeerTerminated(domain: Domain) extends InternalCommand
   private case class EmergencyAskTimeout(lenderId: Domain) extends InternalCommand
   private case object EmptyEmergencyList extends InternalCommand
